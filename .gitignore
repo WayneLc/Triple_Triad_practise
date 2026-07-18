@@ -1,0 +1,25 @@
+# Maven
+/target/
+!*/src/**
+
+# Local Maven installation
+/apache-maven-3.9.9/
+/apache-maven-3.9.9-bin.zip
+
+# IDEs and editors
+/.idea/
+.vscode/
+*.iml
+
+# Logs and system files
+*.log
+*.tmp
+*.swp
+.DS_Store
+
+# Temporary environment
+.env
+
+# OS files
+Thumbs.db
+desktop.ini
