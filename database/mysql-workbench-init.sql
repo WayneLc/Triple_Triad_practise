@@ -41,8 +41,15 @@ CREATE TABLE IF NOT EXISTS rooms (
   password VARCHAR(255),
   turn_seconds INT NOT NULL,
   created_at DATETIME(6),
+  expires_at DATETIME(6),
+  guest_id BIGINT,
+  host_deck_id VARCHAR(255), guest_deck_id VARCHAR(255),
+  host_ready BIT NOT NULL DEFAULT 0, guest_ready BIT NOT NULL DEFAULT 0,
+  status VARCHAR(30) NOT NULL DEFAULT 'WAITING',
+  disconnected_at DATETIME(6), game_state TEXT,
   PRIMARY KEY (id),
-  CONSTRAINT fk_rooms_host FOREIGN KEY (host_id) REFERENCES players(id)
+  CONSTRAINT fk_rooms_host FOREIGN KEY (host_id) REFERENCES players(id),
+  CONSTRAINT fk_rooms_guest FOREIGN KEY (guest_id) REFERENCES players(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS battles (
