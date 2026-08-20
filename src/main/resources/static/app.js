@@ -41,3 +41,98 @@ async function beginMatch(){if(game.b.online){let r=await api('/rooms/'+roomId);
 function onlinePoll(){clearInterval(game.onlineClock);game.onlineClock=setInterval(async()=>{try{let r=await api('/rooms/'+roomId),s=r.gameState&&JSON.parse(r.gameState);if(!s)return;if(JSON.stringify(s.board)!==JSON.stringify(game.board)||s.turn!==game.turn){game.board=s.board||game.board;game.turn=s.turn||game.turn;renderGame();if(game.turn===game.mineColor)clock();else clearInterval(game.clock)}if(game.board.filter(Boolean).length===9){clearInterval(game.onlineClock);end()}}catch(x){}},1000)}
 async function place(p){let g=game;if(g.turn!==g.mineColor||g.board[p]||g.sel===undefined)return;g.board[p]={c:g.my[g.sel],owner:g.mineColor};g.used.push(g.sel);delete g.sel;flip(p,false);clearInterval(g.clock);if(g.board.filter(Boolean).length===9)return end();g.turn=g.mineColor==='blue'?'red':'blue';g.secs=60;renderGame();if(g.b.online){await post('/rooms/'+roomId+'/state',{playerId:me.id,state:JSON.stringify({board:g.board,turn:g.turn})});onlinePoll()}else setTimeout(aiMove,650)}
 if(me)me.showTutorial?tutorial():lobby();else auth();
+
+/* Authoritative online-match flow. Both browsers enter this screen as soon as the
+   host starts a room; the server owns the active turn and its deadline. */
+async function roomLobby(id){
+  stop(); roomId=id; let r;
+  try{r=await api('/rooms/'+id)}catch(_){return online()}
+  if(r.status==='PLAYING')return onlineGame();
+  let host=r.hostId===me.id,mine=host?r.hostReady:r.guestReady,deck=host?r.hostDeckId:r.guestDeckId;
+  app.innerHTML=head()+`<div class="shell"><div class="panel"><h2>${e(r.title)}</h2><p>房間等待中。${r.guestId?'等待雙方準備完成。':'等待另一位玩家加入。'}</p><div class="ready-grid"><div class="blue"><b>藍方（房主）</b><p>${e(r.hostName)} ${r.hostReady?'✓ 準備完畢':'未準備'}</p></div><div class="red"><b>紅方（加入者）</b><p>${r.guestName?e(r.guestName)+(r.guestReady?' ✓ 準備完畢':' 未準備'):'等待加入'}</p></div></div><p>目前卡組：${deck||'尚未選擇'}</p>${!mine?'<button class="primary" onclick="ready(true)">準備完畢</button>':'<button class="secondary" onclick="ready(false)">取消準備</button>'} <button class="secondary" ${mine?'disabled':''} onclick="changeDeck()">卡組</button> ${host?`<button class="primary" ${!(r.hostReady&&r.guestReady)?'disabled':''} onclick="startRoom()">遊戲開始</button><button class="danger" onclick="leave()">解散房間</button>`:'<button class="danger" onclick="leave()">退出</button>'}</div></div>`;
+  poll=setTimeout(()=>roomLobby(id),1500);
+}
+
+async function startRoom(){await post('/rooms/'+roomId+'/start',{playerId:me.id,value:true});return onlineGame()}
+
+async function onlineGame(){
+  stop();
+  let room=await api('/rooms/'+roomId);
+  if(room.status!=='PLAYING')return roomLobby(roomId);
+  let deckId=String(room.hostId===me.id?room.hostDeckId:room.guestDeckId),myDeck=(await api('/players/'+me.id+'/decks')).find(d=>String(d.id)===deckId);
+  if(!myDeck)return toast('找不到已選擇的卡組。');
+  let all=await api('/cards'),my=myDeck.cardIds.split(',').map(Number).map(id=>all.find(c=>c.id===id)).filter(Boolean);
+  if(my.length!==5)return toast('卡組資料無效。');
+  let state=room.gameState&&JSON.parse(room.gameState);
+  if(!state)return toast('正在建立遊戲，請稍候。');
+  window.game={b:{online:true,ruleName:room.ruleName,turnSeconds:room.turnSeconds,hostId:room.hostId,opponent:room.hostId===me.id?room.guestName:room.hostName},my,enemy:[],used:[],enemyUsed:[],board:state.board||Array(9).fill(null),turn:state.turn,mineColor:room.hostId===me.id?'blue':'red',secs:room.turnSeconds,deadlineEpochMs:state.deadlineEpochMs,finished:state.finished,winner:state.winner,reason:state.reason};
+  if(game.finished)return onlineEnd(game);
+  renderGame(); onlinePoll(); onlineTimer();
+}
+
+function onlineTimer(){
+  clearInterval(game.clock);
+  const tick=()=>{if(!game||!game.b.online||game.finished)return;let seconds=Math.max(0,Math.ceil((game.deadlineEpochMs-Date.now())/1000));game.secs=seconds;let timer=document.querySelector('#timer');if(timer)timer.textContent=seconds;};
+  tick(); game.clock=setInterval(tick,250);
+}
+
+function onlineEnd(state){
+  clearInterval(game.clock); clearInterval(game.onlineClock); game.finished=true;
+  let win=state.winner===game.mineColor,reason=state.reason==='timeout'?'（對手回合逾時）':'';
+  renderGame(); app.insertAdjacentHTML('beforeend',`<div class="dialog" style="position:fixed;inset:0;background:#0009;display:grid;place-items:center;padding:20px"><div class="panel" style="max-width:420px;text-align:center"><h1>${win?'勝利！':'敗北'}</h1><p>${reason||'遊戲結束'}</p><button class="primary" onclick="online()">返回連線大廳</button></div></div>`);
+}
+
+function syncOnlineState(state){
+  game.board=state.board||game.board; game.turn=state.turn||game.turn; game.deadlineEpochMs=state.deadlineEpochMs||game.deadlineEpochMs; game.finished=Boolean(state.finished); game.winner=state.winner; game.reason=state.reason;
+}
+
+function onlinePoll(){
+  clearInterval(game.onlineClock);
+  game.onlineClock=setInterval(async()=>{try{
+    let room=await api('/rooms/'+roomId),state=room.gameState&&JSON.parse(room.gameState);
+    if(!state)return;
+    if(state.finished)return onlineEnd(state);
+    let changed=JSON.stringify(state.board)!==JSON.stringify(game.board)||state.turn!==game.turn||state.deadlineEpochMs!==game.deadlineEpochMs;
+    if(changed){syncOnlineState(state);renderGame();onlineTimer();}
+  }catch(_){/* Keep the last valid board visible while a request is retried. */}},1000);
+}
+
+async function place(p){
+  let g=game;
+  if(g.turn!==g.mineColor||g.board[p]||g.sel===undefined||g.finished)return;
+  g.board[p]={c:g.my[g.sel],owner:g.mineColor};g.used.push(g.sel);delete g.sel;flip(p,false);clearInterval(g.clock);
+  if(!g.b.online){
+    if(g.board.filter(Boolean).length===9)return end();
+    g.turn=g.mineColor==='blue'?'red':'blue';g.secs=g.b.turnSeconds||60;renderGame();
+    return setTimeout(aiMove,650);
+  }
+  if(!roomId){toast('找不到連線房間，請返回連線大廳後重新加入。');return;}
+  g.turn=g.mineColor==='blue'?'red':'blue';
+  try{
+    let room=await post('/rooms/'+roomId+'/state',{playerId:me.id,state:JSON.stringify({board:g.board,turn:g.turn})}),state=room.gameState&&JSON.parse(room.gameState);
+    if(state){syncOnlineState(state);if(state.finished)return onlineEnd(state);renderGame();onlineTimer();}
+  }catch(error){toast(error.message);onlinePoll();}
+}
+
+/* Pause room polling while the deck chooser is displayed. */
+function chooseDeck(ds,title){
+  stop();
+  return new Promise(resolve=>{app.innerHTML=head()+`<div class="shell"><h2>${e(title)}</h2><div class="rule-list">${ds.map(d=>`<button class="rule" onclick="window.choose(${d.id})"><b>${e(d.name)}</b><p>${e(d.cardIds)}</p></button>`).join('')}</div></div>`;window.choose=id=>resolve(ds.find(d=>d.id===id));});
+}
+async function changeDeck(){
+  stop(); const deck=await chooseDeck(await api('/players/'+me.id+'/decks'),'選擇卡組');
+  if(!deck)return roomLobby(roomId);
+  await post('/rooms/'+roomId+'/deck',{playerId:me.id,deckId:String(deck.id)});
+  return roomLobby(roomId);
+}
+
+function opponentCard(c,color){
+  return `<div class="used" style="position:relative;opacity:.5;pointer-events:none"><button class="card ${color==='red'?'enemy':''}" disabled><div class="stars">${'★'.repeat(c.stars)}</div><h4>${e(c.name)}</h4><div class="nums"><i class="t">${c.topValue}</i><i class="r">${c.rightValue}</i><i class="b">${c.bottomValue}</i><i class="l">${c.leftValue}</i></div></button><b style="position:absolute;inset:0;display:grid;place-items:center;color:#f33;font-size:70px;text-shadow:1px 1px #fff">X</b></div>`;
+}
+function remoteBack(color){return `<div class="card ${color==='red'?'enemy':''}" style="display:grid;place-items:center;pointer-events:none"><b>對手卡牌</b></div>`;}
+function renderGame(){
+  let g=game,local=g.mineColor==='blue'?'藍方':'紅方',opposite=g.mineColor==='blue'?'紅方':'藍方',enemyColor=g.mineColor==='blue'?'red':'blue';
+  let played=g.b.online?g.board.filter(x=>x&&x.owner===enemyColor).map(x=>x.c):[];
+  let opponent=g.b.online?Array.from({length:5},(_,i)=>played[i]?opponentCard(played[i],enemyColor):remoteBack(enemyColor)).join(''):g.enemy.map((c,i)=>sideCard(c,enemyColor,g.enemyUsed.includes(i),i)).join('');
+  app.innerHTML=`<section class="game">${head(false)}<div class="arena"><div class="status">${g.b.ruleName}｜${g.turn===g.mineColor?'輪到你（'+local+'）':'輪到對手（'+opposite+'）'}｜思考時間 <span id="timer" class="timer">${g.secs}</span> 秒</div><div class="opponent-hand" style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:20px 0 0">${opponent}</div><div class="battle-layout"><aside class="fighter blue"><b>${g.mineColor==='blue'?e(me.username):e(g.b.opponent||'對手')}</b><p>藍方</p></aside><div class="board">${g.board.map((x,i)=>`<button class="cell" onclick="place(${i})">${x?board(x):''}</button>`).join('')}</div><aside class="fighter red"><b>${g.mineColor==='red'?e(me.username):e(g.b.opponent||'對手')}</b><p>紅方</p></aside></div><div class="hand">${g.my.map((c,i)=>sideCard(c,g.mineColor,g.used.includes(i),i)).join('')}</div></div></section>`;
+}
