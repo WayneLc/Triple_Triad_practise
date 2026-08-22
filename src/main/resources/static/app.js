@@ -47,6 +47,7 @@ if(me)me.showTutorial?tutorial():lobby();else auth();
 async function roomLobby(id){
   stop(); roomId=id; let r;
   try{r=await api('/rooms/'+id)}catch(_){return online()}
+  if(handleRoomDeparture(r))return;
   if(r.status==='PLAYING')return onlineGame();
   let host=r.hostId===me.id,mine=host?r.hostReady:r.guestReady,deck=host?r.hostDeckId:r.guestDeckId;
   app.innerHTML=head()+`<div class="shell"><div class="panel"><h2>${e(r.title)}</h2><p>房間等待中。${r.guestId?'等待雙方準備完成。':'等待另一位玩家加入。'}</p><div class="ready-grid"><div class="blue"><b>藍方（房主）</b><p>${e(r.hostName)} ${r.hostReady?'✓ 準備完畢':'未準備'}</p></div><div class="red"><b>紅方（加入者）</b><p>${r.guestName?e(r.guestName)+(r.guestReady?' ✓ 準備完畢':' 未準備'):'等待加入'}</p></div></div><p>目前卡組：${deck||'尚未選擇'}</p>${!mine?'<button class="primary" onclick="ready(true)">準備完畢</button>':'<button class="secondary" onclick="ready(false)">取消準備</button>'} <button class="secondary" ${mine?'disabled':''} onclick="changeDeck()">卡組</button> ${host?`<button class="primary" ${!(r.hostReady&&r.guestReady)?'disabled':''} onclick="startRoom()">遊戲開始</button><button class="danger" onclick="leave()">解散房間</button>`:'<button class="danger" onclick="leave()">退出</button>'}</div></div>`;
@@ -89,7 +90,7 @@ function syncOnlineState(state){
 function onlinePoll(){
   clearInterval(game.onlineClock);
   game.onlineClock=setInterval(async()=>{try{
-    let room=await api('/rooms/'+roomId),state=room.gameState&&JSON.parse(room.gameState);
+    let room=await api('/rooms/'+roomId);if(room.status!=='PLAYING')return roomLobby(roomId);let state=room.gameState&&JSON.parse(room.gameState);
     if(!state)return;
     if(state.finished)return onlineEnd(state);
     let changed=JSON.stringify(state.board)!==JSON.stringify(game.board)||state.turn!==game.turn||state.deadlineEpochMs!==game.deadlineEpochMs;
@@ -97,10 +98,49 @@ function onlinePoll(){
   }catch(_){/* Keep the last valid board visible while a request is retried. */}},1000);
 }
 
+/* Final synchronization and departure handling overrides. */
+async function join(id,locked){
+  let decks=await api('/players/'+me.id+'/decks');if(!decks.length)return showDeckRequired();
+  let password='';if(locked){
+    password=prompt('輸入四位數密碼');if(password===null)return;
+    try{await post('/rooms/'+id+'/password',{password});}catch(error){toast(error.message.includes('密碼')?'密碼錯誤，請重新加入房間。':'該房間目前無法加入。');return;}
+  }
+  let deck=await chooseDeck(decks,'加入房間前請選擇卡組');if(!deck)return online();
+  try{await post('/rooms/'+id+'/join',{password,playerId:me.id,deckId:String(deck.id)});roomLobby(id);}catch(_){toast('目前無法加入此房間，請重新加入。');}
+}
+function watchFinishedRoom(){
+  clearInterval(game.departureWatch);
+  game.departureWatch=setInterval(async()=>{try{
+    let room=await api('/rooms/'+roomId);
+    if(room.status==='WAITING'&&room.hostId===me.id&&!room.guestId){clearInterval(game.departureWatch);return departureDialog('對手已退出房間或已斷線','返回房間',()=>roomLobby(room.id));}
+  }catch(_){clearInterval(game.departureWatch);departureDialog('房主退出房間或已斷線','返回大廳',online);}},1000);
+}
+function onlineEnd(state){
+  clearInterval(game.clock);clearInterval(game.onlineClock);syncOnlineState(state);game.finished=true;
+  let draw=state.winner==='draw',won=state.winner===game.mineColor,timeout=state.reason==='timeout',title=draw?'平手':won?'勝利':'敗北',detail=timeout?(won?'（對手逾時敗北）':'（你已逾時）'):'九宮格已填滿。';
+  renderGame();app.insertAdjacentHTML('beforeend',`<div class="dialog" style="position:fixed;inset:0;background:#0009;display:grid;place-items:center;padding:20px"><div class="panel" style="max-width:440px;text-align:center"><h1>${title}</h1><p>${detail}</p><p>是否重新進行對局？</p><button class="primary" onclick="askOnlineRematch()">是</button> <button class="secondary" onclick="finishOnlineMatch()">否</button></div></div>`);watchFinishedRoom();
+}
+function onlinePoll(){
+  clearInterval(game.onlineClock);let beat=0;
+  game.onlineClock=setInterval(async()=>{try{
+    if(++beat%3===0)post('/rooms/'+roomId+'/heartbeat',{playerId:me.id}).catch(()=>{});
+    let room=await api('/rooms/'+roomId);
+    if(handleRoomDeparture(room))return;
+    if(room.status!=='PLAYING'){
+      if(room.hostId===me.id&&!room.guestId)return departureDialog('對手已退出房間或已斷線','返回房間',()=>roomLobby(room.id));
+      return roomLobby(roomId);
+    }
+    let state=room.gameState&&JSON.parse(room.gameState);if(!state)return;
+    if(state.finished){syncOnlineState(state);renderGame();return setTimeout(()=>onlineEnd(state),250);}
+    let changed=JSON.stringify(state.board)!==JSON.stringify(game.board)||state.turn!==game.turn||state.deadlineEpochMs!==game.deadlineEpochMs;
+    if(changed){syncOnlineState(state);renderGame();onlineTimer();}
+  }catch(_){/* Retry: only a server departure event should end the match. */}},1000);
+}
+
 async function place(p){
   let g=game;
   if(g.turn!==g.mineColor||g.board[p]||g.sel===undefined||g.finished)return;
-  g.board[p]={c:g.my[g.sel],owner:g.mineColor};g.used.push(g.sel);delete g.sel;flip(p,false);clearInterval(g.clock);
+  g.board[p]={c:g.my[g.sel],owner:g.mineColor,playedBy:g.mineColor};g.used.push(g.sel);delete g.sel;flip(p,false);clearInterval(g.clock);
   if(!g.b.online){
     if(g.board.filter(Boolean).length===9)return end();
     g.turn=g.mineColor==='blue'?'red':'blue';g.secs=g.b.turnSeconds||60;renderGame();
@@ -132,7 +172,172 @@ function opponentCard(c,color){
 function remoteBack(color){return `<div class="card ${color==='red'?'enemy':''}" style="display:grid;place-items:center;pointer-events:none"><b>對手卡牌</b></div>`;}
 function renderGame(){
   let g=game,local=g.mineColor==='blue'?'藍方':'紅方',opposite=g.mineColor==='blue'?'紅方':'藍方',enemyColor=g.mineColor==='blue'?'red':'blue';
-  let played=g.b.online?g.board.filter(x=>x&&x.owner===enemyColor).map(x=>x.c):[];
-  let opponent=g.b.online?Array.from({length:5},(_,i)=>played[i]?opponentCard(played[i],enemyColor):remoteBack(enemyColor)).join(''):g.enemy.map((c,i)=>sideCard(c,enemyColor,g.enemyUsed.includes(i),i)).join('');
+  let played=g.b.online?g.board.filter(x=>x&&x.playedBy===enemyColor).map(x=>x.c):[];
+  let opponent=g.b.online
+    ?Array.from({length:5},(_,i)=>played[i]?opponentCard(played[i],enemyColor):remoteBack(enemyColor)).join('')
+    :g.enemy.map((c,i)=>g.enemyUsed.includes(i)?opponentCard(c,enemyColor):remoteBack(enemyColor)).join('');
   app.innerHTML=`<section class="game">${head(false)}<div class="arena"><div class="status">${g.b.ruleName}｜${g.turn===g.mineColor?'輪到你（'+local+'）':'輪到對手（'+opposite+'）'}｜思考時間 <span id="timer" class="timer">${g.secs}</span> 秒</div><div class="opponent-hand" style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:20px 0 0">${opponent}</div><div class="battle-layout"><aside class="fighter blue"><b>${g.mineColor==='blue'?e(me.username):e(g.b.opponent||'對手')}</b><p>藍方</p></aside><div class="board">${g.board.map((x,i)=>`<button class="cell" onclick="place(${i})">${x?board(x):''}</button>`).join('')}</div><aside class="fighter red"><b>${g.mineColor==='red'?e(me.username):e(g.b.opponent||'對手')}</b><p>紅方</p></aside></div><div class="hand">${g.my.map((c,i)=>sideCard(c,g.mineColor,g.used.includes(i),i)).join('')}</div></div></section>`;
+}
+
+/* Online lobby and match flow overrides. */
+async function online(){
+  stop();let rooms=await api('/rooms');
+  app.innerHTML=head()+`<div class="shell"><div class="section-head"><div><h2>連線對戰</h2><small>每 30 秒自動刷新</small></div><div><button class="secondary" onclick="online()">刷新</button> <button class="primary" onclick="roomForm()">創建遊戲房間</button></div></div><div class="room-list">${rooms.map(r=>{let state=r.status==='PLAYING'?'遊玩中':r.guestId?'人數已滿 (2/2)':'等待玩家 (1/2)';return `<div class="room"><div><strong>${e(r.title)}</strong><small>房主：${e(r.hostName)}｜${e(r.ruleName)}｜${state}${r.passwordRequired?'｜密碼':''}</small></div>${r.hostId===me.id?`<button class="secondary" onclick="roomLobby(${r.id})">進入房間</button>`:r.status==='PLAYING'||r.guestId?'<button disabled>無法加入</button>':`<button class="primary" onclick="join(${r.id},${r.passwordRequired})">加入</button>`}</div>`}).join('')||'<div class="panel">目前沒有房間。</div>'}</div></div>`;
+  poll=setTimeout(online,30000);
+}
+function roomForm(){stop();app.innerHTML=head()+`<div class="shell"><div class="panel"><h2>創建遊戲房間</h2><label>名稱</label><input id="title"><label>規則</label><select id="ruleName"><option value="STANDARD">標準（Standard）</option><option value="PLUS">加算（Plus）</option><option value="SAME">同數（Same）</option><option value="REVERSE">逆轉（Reverse）</option></select><label>密碼（可留空）</label><input id="rp" maxlength="4"><label>每回合思考秒數</label><select id="sec"><option>60</option><option>45</option><option>30</option></select><button class="primary wide" onclick="create()">創建</button></div></div>`}
+
+async function onlineGame(){
+  stop();let room=await api('/rooms/'+roomId);if(room.status!=='PLAYING')return roomLobby(roomId);
+  if(handleRoomDeparture(room))return;
+  let deckId=String(room.hostId===me.id?room.hostDeckId:room.guestDeckId),deck=(await api('/players/'+me.id+'/decks')).find(d=>String(d.id)===deckId),state=room.gameState&&JSON.parse(room.gameState);
+  if(!deck||!state)return toast('正在建立遊戲，請稍候。');
+  let all=await api('/cards'),my=deck.cardIds.split(',').map(Number).map(id=>all.find(c=>c.id===id)).filter(Boolean);
+  window.game={b:{online:true,ruleName:room.ruleName,turnSeconds:room.turnSeconds,hostId:room.hostId,opponent:room.hostId===me.id?room.guestName:room.hostName},my,enemy:[],used:[],enemyUsed:[],board:state.board||Array(9).fill(null),turn:state.turn,mineColor:room.hostId===me.id?'blue':'red',secs:room.turnSeconds,deadlineEpochMs:state.deadlineEpochMs,finished:state.finished,winner:state.winner,reason:state.reason,toss:state.toss||[]};
+  if(game.finished)return onlineEnd(game);
+  if(game.toss.length===3)return showOnlineDraw();
+  renderGame();onlinePoll();onlineTimer();
+}
+function showOnlineDraw(){let g=game;app.innerHTML=`<section class="game">${head(false)}<div class="arena"><div class="draw-screen"><h1>決定先攻</h1><p>翻開三張紅／藍卡，較多顏色的一方先攻。</p><div class="draw-cards">${g.toss.map((color,i)=>`<div class="draw-card ${color}" style="animation-delay:${i*.45}s"><span>?</span><b>${color==='blue'?'藍方':'紅方'}</b></div>`).join('')}</div><h2>${g.turn==='blue'?'藍方先攻！':'紅方先攻！'}</h2></div></div></section>`;setTimeout(()=>{if(!game||game.finished)return;game.toss=[];renderGame();onlinePoll();onlineTimer();},4000)}
+function onlineEnd(state){
+  clearInterval(game.clock);clearInterval(game.onlineClock);game.finished=true;
+  let draw=state.winner==='draw',won=state.winner===game.mineColor,timeout=state.reason==='timeout',title=draw?'平手':won?'勝利':'敗北',detail=timeout?(won?'（對手逾時敗北）':'（你已逾時）'):'九宮格已填滿。';
+  renderGame();app.insertAdjacentHTML('beforeend',`<div class="dialog" style="position:fixed;inset:0;background:#0009;display:grid;place-items:center;padding:20px"><div class="panel" style="max-width:440px;text-align:center"><h1>${title}</h1><p>${detail}</p><p>是否重新進行對局？</p><button class="primary" onclick="askOnlineRematch()">是</button> <button class="secondary" onclick="finishOnlineMatch()">否</button></div></div>`);watchFinishedRoom();
+}
+function askOnlineRematch(){app.insertAdjacentHTML('beforeend',`<div class="dialog" style="position:fixed;inset:0;background:#0009;display:grid;place-items:center;padding:20px"><div class="panel" style="max-width:440px;text-align:center"><h2>是否更換牌組？</h2><button class="primary" onclick="onlineNext('CHANGE')">更換牌組</button> <button class="secondary" onclick="onlineNext('SAME')">否，直接再戰</button></div></div>`)}
+async function onlineNext(option){let room=await post('/rooms/'+roomId+'/next',{playerId:me.id,option});return option==='SAME'?onlineGame():roomLobby(room.id)}
+async function finishOnlineMatch(){let room=await post('/rooms/'+roomId+'/next',{playerId:me.id,option:'EXIT'});return room.hostId===me.id?roomLobby(room.id):online()}
+
+/* Both players must decide before the server starts the next round. */
+async function onlineNext(option){
+  let room=await post('/rooms/'+roomId+'/next-decision',{playerId:me.id,option});
+  if(room.status==='WAITING')return roomLobby(room.id);
+  let state=room.gameState&&JSON.parse(room.gameState);
+  if(state&&!state.finished)return onlineGame();
+  app.innerHTML=`<section class="game">${head(false)}<div class="arena"><div class="panel result"><h2>等待對手選擇下一局…</h2><p>雙方皆選擇繼續才會直接再戰；任一方選擇更換牌組，則會回到準備房間。</p></div></div></section>`;
+  waitNextDecision();
+}
+async function waitNextDecision(){
+  clearInterval(game&&game.nextClock);game.nextClock=setInterval(async()=>{try{
+    let room=await api('/rooms/'+roomId),state=room.gameState&&JSON.parse(room.gameState);
+    if(handleRoomDeparture(room)){clearInterval(game.nextClock);return;}
+    if(room.status==='HOST_LEFT'){clearInterval(game.nextClock);return departureDialog('對手已退出房間','退出房間',online);}
+    if(room.hostId===me.id&&!room.guestId){clearInterval(game.nextClock);return departureDialog('對手已退出房間','返回房間',()=>roomLobby(room.id));}
+    if(room.status==='WAITING'){clearInterval(game.nextClock);return roomLobby(room.id);}
+    if(state&&!state.finished){clearInterval(game.nextClock);return onlineGame();}
+  }catch(_){clearInterval(game.nextClock);online();}},1000);
+}
+async function finishOnlineMatch(){
+  await post('/rooms/'+roomId+'/next-decision',{playerId:me.id,option:'EXIT'});
+  return online();
+}
+
+function departureDialog(message,button,target){
+  stop();let seconds=15;
+  app.insertAdjacentHTML('beforeend',`<div class="dialog" id="departure-dialog" style="position:fixed;inset:0;background:#0009;display:grid;place-items:center;padding:20px"><div class="panel" style="max-width:440px;text-align:center"><h2>${message}</h2><p><span id="departure-seconds">15</span> 秒後將自動返回。</p><button class="primary" onclick="window.departureReturn()">${button}</button></div></div>`);
+  window.departureReturn=()=>{clearInterval(window.departureTimer);target();};
+  clearInterval(window.departureTimer);window.departureTimer=setInterval(()=>{seconds--;let label=document.querySelector('#departure-seconds');if(label)label.textContent=seconds;if(seconds<=0)window.departureReturn();},1000);
+}
+/* The server keeps this event for 15 seconds so the remaining player can see
+   why the room ended instead of treating every failed poll as a disconnect. */
+function departureDialog(message,button,target){
+  if(window.departureActive)return;
+  window.departureActive=true;stop();
+  if(window.game){clearInterval(game.clock);clearInterval(game.onlineClock);clearInterval(game.departureWatch);clearInterval(game.nextClock);}
+  let seconds=15;
+  app.insertAdjacentHTML('beforeend',`<div class="dialog" id="departure-dialog" style="position:fixed;inset:0;background:#0009;display:grid;place-items:center;padding:20px"><div class="panel" style="max-width:440px;text-align:center"><h2>${message}</h2><p><span id="departure-seconds">15</span> 秒後將自動返回。</p><button class="primary" onclick="window.departureReturn()">${button}</button></div></div>`);
+  window.departureReturn=()=>{clearInterval(window.departureTimer);window.departureActive=false;target();};
+  clearInterval(window.departureTimer);window.departureTimer=setInterval(()=>{seconds--;let label=document.querySelector('#departure-seconds');if(label)label.textContent=seconds;if(seconds<=0)window.departureReturn();},1000);
+}
+function handleRoomDeparture(room){
+  if(!room.departureRole)return false;
+  let amHost=room.hostId===me.id,hostLeft=room.departureRole==='HOST';
+  if((hostLeft&&amHost)||(!hostLeft&&!amHost))return false;
+  if(room.departurePhase==='POST_GAME'){
+    departureDialog('對手已退出房間',amHost?'返回房間':'退出房間',amHost?()=>roomLobby(room.id):online);
+    return true;
+  }
+  let disconnected=room.departureReason==='DISCONNECTED';
+  departureDialog(hostLeft?(disconnected?'房主已斷線':'房主退出房間'):(disconnected?'對手已斷線':'對手已退出房間'),hostLeft?'返回大廳':'返回房間',hostLeft?online:()=>roomLobby(room.id));
+  return true;
+}
+function watchFinishedRoom(){
+  clearInterval(game&&game.departureWatch);let beat=0;
+  const check=async()=>{try{
+    if(++beat%3===0)post('/rooms/'+roomId+'/heartbeat',{playerId:me.id}).catch(()=>{});
+    let room=await api('/rooms/'+roomId);
+    if(handleRoomDeparture(room))return;
+  }catch(_){/* A transient request failure is not evidence that the host left. */}};
+  check();game.departureWatch=setInterval(check,1000);
+}
+function onlinePollLegacy(){
+  clearInterval(game.onlineClock);let beat=0;
+  game.onlineClock=setInterval(async()=>{try{
+    if(++beat%3===0)post('/rooms/'+roomId+'/heartbeat',{playerId:me.id}).catch(()=>{});
+    let room=await api('/rooms/'+roomId);
+    if(room.status!=='PLAYING'){
+      if(room.hostId===me.id&&!room.guestId)return departureDialog('對手退出遊戲或已斷線','返回房間',()=>roomLobby(room.id));
+      return roomLobby(roomId);
+    }
+    let state=room.gameState&&JSON.parse(room.gameState);if(!state)return;
+    if(state.finished)return onlineEnd(state);
+    let changed=JSON.stringify(state.board)!==JSON.stringify(game.board)||state.turn!==game.turn||state.deadlineEpochMs!==game.deadlineEpochMs;
+    if(changed){syncOnlineState(state);renderGame();onlineTimer();}
+  }catch(_){departureDialog('房主已退出遊戲','返回大廳',online);}},1000);
+}
+
+/* Final room creation/join overrides. Password validation intentionally occurs
+   before changing to the deck picker, so an invalid password keeps this view. */
+function roomForm(){
+  stop();app.innerHTML=head()+`<div class="shell"><div class="panel"><h2>創建遊戲房間</h2><label>名稱</label><input id="title"><label>規則</label><select id="ruleName"><option value="STANDARD">標準（Standard）</option><option value="PLUS">加算（Plus）</option><option value="SAME">同數（Same）</option><option value="REVERSE">逆轉（Reverse）</option></select><label>密碼（可留空，限 4 位數字）</label><input id="rp" inputmode="numeric" pattern="[0-9]{4}"><label>每回合思考秒數</label><select id="sec"><option>60</option><option>45</option><option>30</option></select><button class="primary wide" onclick="create()">創建</button></div></div>`;
+}
+async function create(){
+  let password=document.querySelector('#rp').value.trim();
+  if(password&&!/^\d{4}$/.test(password)){toast('房間密碼必須為 4 位數字。');return;}
+  try{let r=await post('/rooms',{hostId:me.id,title:document.querySelector('#title').value,ruleName:document.querySelector('#ruleName').value,password,turnSeconds:+document.querySelector('#sec').value});roomLobby(r.id);}catch(error){toast(error.message);}
+}
+async function join(id,locked){
+  let decks=await api('/players/'+me.id+'/decks');if(!decks.length)return showDeckRequired();
+  let password='';
+  if(locked){
+    password=prompt('輸入四位數密碼');if(password===null)return;
+    try{await post('/rooms/'+id+'/password',{password});}catch(_){toast('密碼錯誤，請重新加入房間。');return;}
+  }
+  let deck=await chooseDeck(decks,'加入房間前請選擇卡組');if(!deck)return online();
+  try{await post('/rooms/'+id+'/join',{password,playerId:me.id,deckId:String(deck.id)});roomLobby(id);}catch(error){toast(error.message.includes('密碼')?'密碼錯誤，請重新加入房間。':'目前無法加入此房間，請重新加入。');}
+}
+function handleRoomDeparture(room){
+  if(!room.departureRole)return false;
+  let amHost=room.hostId===me.id,hostLeft=room.departureRole==='HOST';
+  if((hostLeft&&amHost)||(!hostLeft&&!amHost))return false;
+  if(room.departurePhase==='POST_GAME'){
+    if(game&&game.awaitingRematchChoice){game.pendingDeparture=room;return false;}
+    if(hostLeft){online();toast('房主已解散房間');}
+    else{roomLobby(room.id);setTimeout(()=>toast('對手已退出房間'),0);}
+    return true;
+  }
+  let disconnected=room.departureReason==='DISCONNECTED';
+  departureDialog(hostLeft?(disconnected?'房主已斷線':'房主退出房間'):(disconnected?'對手已斷線':'對手已退出房間'),hostLeft?'返回大廳':'返回房間',hostLeft?online:()=>roomLobby(room.id));
+  return true;
+}
+
+/* Keep the deck-change choice visible if the player already chose to continue.
+   The pending room departure is applied immediately after that choice is made. */
+function askOnlineRematch(){
+  game.awaitingRematchChoice=true;
+  app.insertAdjacentHTML('beforeend',`<div class="dialog" style="position:fixed;inset:0;background:#0009;display:grid;place-items:center;padding:20px"><div class="panel" style="max-width:440px;text-align:center"><h2>是否更換牌組？</h2><button class="primary" onclick="onlineNext('CHANGE')">更換牌組</button> <button class="secondary" onclick="onlineNext('SAME')">否，直接再戰</button></div></div>`);
+}
+async function onlineNext(option){
+  game.awaitingRematchChoice=false;
+  let latest;
+  try{latest=await api('/rooms/'+roomId);}catch(_){return online();}
+  if(game.pendingDeparture){let departure=game.pendingDeparture;delete game.pendingDeparture;handleRoomDeparture(departure);return;}
+  if(handleRoomDeparture(latest))return;
+  let room=await post('/rooms/'+roomId+'/next-decision',{playerId:me.id,option});
+  if(handleRoomDeparture(room))return;
+  if(room.status==='WAITING')return roomLobby(room.id);
+  let state=room.gameState&&JSON.parse(room.gameState);
+  if(state&&!state.finished)return onlineGame();
+  app.innerHTML=`<section class="game">${head(false)}<div class="arena"><div class="panel result"><h2>等待對手選擇下一局…</h2></div></div></section>`;
+  waitNextDecision();
 }
